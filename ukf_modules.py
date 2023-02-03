@@ -6,7 +6,7 @@ import numpy as np
 import attn_modules as attn
 import scipy.linalg
 
-# sqrtm
+# sqrtm **** NOT MY CODE ****
 class MatrixSquareRoot(Function):
     """Square root of a positive definite matrix.
     NOTE: matrix square root is not differentiable for matrices with
@@ -46,18 +46,18 @@ def sigma_points(x, P_u, Q_k):
     Inputs: [1xN] vector, the previous covaroiance matrix P_u[+|k-1], and process noise Q_k
     Returns: [2NxN] vector of sigma points, and a [NxN] matrix of covariance P_u[-|k]
     """
-
+    
     sigma = x.repeat(1,1,1,x.shape[2])
-
     p = sqrtm(x.shape[2]*torch.abs(P_u.squeeze()))    
-    sigma_plus = sigma + p
+
+    sigma_plus = sigma + p.reshape(1,1,sigma.shape[3],sigma.shape[3])
     sigma_minus = sigma - p
 
     sigma = torch.concat((sigma_plus, sigma_minus), dim=3)
+
     scale_factor = 1/(2*x.shape[2])
     x_bar = torch.mean(sigma, dim=3)
-    sum = torch.zeros((x.shape[1],x.shape[2],x.shape[2]))
-    extra = np.zeros((x.shape[2]*2,x.shape[2],x.shape[2]))
+    sum = torch.zeros((x.shape[1],x.shape[2],x.shape[2])).cuda()
 
     for i2 in range(sigma.shape[1]):
         for i1 in range(sigma.shape[3]):
@@ -65,10 +65,11 @@ def sigma_points(x, P_u, Q_k):
             c = (vecp.squeeze()-x_bar[0,i2].squeeze().T)
             sum[i2] += torch.matmul(c.unsqueeze(-1), c.unsqueeze(0))
 
-    P_k = sum*scale_factor + (Q_k**2)*0.01
+    P_k = sum*scale_factor + (Q_k**2)*0.05
+    
+    del sum
     
     return P_k, sigma.permute(0,1,3,2) #, extra # The sigma points for X_hat[k|k-1] and the cross variance matrix for X_hat[k|k-1]
-    #return sigma, x_bar
 
 # Returns: Updated X post, P_k post, K_k for record keeping
 def UKF_update(x_sigma, y_sigma, R_k, P_u, Y):
@@ -86,9 +87,8 @@ def UKF_update(x_sigma, y_sigma, R_k, P_u, Y):
     
     x_bar = torch.mean(x_sigma, dim=2) # This give a Nx1 vector of the means
     y_bar = torch.mean(y_sigma, dim=2)
-    scale_factor = 1/(x_sigma.shape[2])
-
-    P_xy = torch.zeros((x_sigma.shape[1],x_bar.shape[2],x_bar.shape[2]))
+    scale_factor = 1/(2*x_sigma.shape[2])
+    P_xy = torch.zeros((x_sigma.shape[1],x_bar.shape[2],x_bar.shape[2])).cuda()
     P_yy = P_xy
     
     for i2 in range(P_xy.shape[0]):
@@ -113,35 +113,42 @@ def UKF_update(x_sigma, y_sigma, R_k, P_u, Y):
     X_k_posterior = x_bar.squeeze() + torch.matmul(K_k, res).unsqueeze(0).permute(0,2,1).squeeze()
    
     P_k_posterior = P_u - torch.matmul(K_k.squeeze(), torch.matmul(P_yy.squeeze(), K_k.squeeze().T)).unsqueeze(0)
-
+    
+    del P_yy
+    del P_xy
+    
     return X_k_posterior, P_k_posterior, K_k # Returns X_k|k, P_k|k, K_k
 
 # Returns: X_hat
 class dynamic_model(nn.Module):
-    def __init__(self,numVstates):
+    def __init__(self,numVstates, latent_size, enc_, dec_, emb_, hist_):
         super().__init__()
         """
         Module predicts the current states based on learned and physical dynamic models. Is run between frames
         Inputs: Vehicle state time k-1, latent features time k-1, dt
         Returns: Vehicle state prediciton X_k_hat and latent feature prediciton X_thetaHat_k at time k
         """
-        self.model = attn.encoder_attn(numVstates)# this will be the full transformer
+        self.model = attn.encoder_attn(numVstates, 4, enc_, dec_, emb_)# this will be the full transformer
         self.dynamics_v = dynamic_model_vehicle()
         self.sigma_ = sigma_points
+        self.l_reshape_size = latent_size//4
+        self.hist_len = hist_
         
        
     def forward(self, state_vehicle, state_latent, key, dt, P_x, P_theta,  Q_l, Q_x):
-        #print('Vehicle', state_vehicle.shape, 'latent', state_latent.shape)
         P_x, vehicle_sigma = self.sigma_(state_vehicle, P_x, Q_x) # Convert vehicle state into sigma points
+        sqrtm(torch.abs(P_x.squeeze()))
         x_p_hat_sigma = self.dynamics_v(vehicle_sigma, dt) # Model of vehicle dynamcis in real world with state space matrix. Input: [X_k-1_sigma, dt] Return: posteriori estimate X_k_hat
         x_p_hat = torch.mean(x_p_hat_sigma, dim = 2) # Mean of sigma points represent "true" posterior state
         
+        # Loop is a carry over from when the filtered space was too large. Is used if state_latent has batch_size > 1
         for i1 in range(state_latent.shape[0]):
             s = state_latent[i1].unsqueeze(0)
             P_theta_, latent_sigma = self.sigma_(s, P_theta, Q_l) # Convert latent space into sigma points and pass as "Values" through transformer
 
-        v_state_current = x_p_hat.repeat(1,8,1)
-        Q = torch.concat((state_latent.reshape((1,8,32)), v_state_current), dim = 2) # [1, 8, 41]: 8 windows from 1024, size 32 per window, + 9 states
+        v_state_current = x_p_hat.repeat(1,4,1)
+
+        Q = torch.concat((state_latent.reshape((1,4,self.l_reshape_size)), v_state_current), dim = 2) # [1, 8, 41]: 8 windows from 1024, size 32 per window, + 9 states
         K = key
         V = latent_sigma.squeeze().unsqueeze(0)
         x_theta = self.model.dynamic_update(Q, K, V).unsqueeze(0) #inputs: q, k, v #latent_sigma, , dt, P_theta, P_x
@@ -149,12 +156,13 @@ class dynamic_model(nn.Module):
         for i1 in range(state_latent.shape[0]):
             s = x_theta[i1].unsqueeze(0)
             P_theta_, x_theta_sigma = self.sigma_(s, P_theta, Q_l) # Convert latent space into sigma points and pass as "Values" through transformer
-        return x_theta_sigma, x_p_hat_sigma, P_x, P_theta_ # X_theta is the predicted theta state , X_phat is the predicted vehicle state Dr. arguelles, Dr. Day, Dr. Huanyu, 
-
+            
+        return x_theta_sigma, x_p_hat_sigma, P_x, P_theta_ # X_theta is the predicted theta state , X_phat is the predicted vehicle state
+    
     def embed(self, x_theta, x_vehicle):
         # Inputs: latent space and vehicle state for last 4 time steps [k-1,k-4]
-        v_state = x_vehicle.repeat(1,8,1)
-        inp = torch.concat((x_theta.squeeze(), v_state), dim = 2)
+        v_state = x_vehicle.repeat(1,self.hist_len,1) # (1,8,1)
+        inp = torch.concat((x_theta, v_state), dim = 2)
 
         k = self.model.key_emb(inp)
         return k
@@ -167,9 +175,6 @@ class dynamic_model_vehicle(nn.Module):
         Inputs: vehicle state X_k, dt
         Returns: Vehicle estimated state X_k+dt
         """
-        x = np.zeros(3)
-        x_ = torch.from_numpy(x)
-        parameters = nn.Parameter(data = x_, requires_grad = True) # Define dynamic model as nn parameters to propagate gradients through
         self.state_space =np.array([[0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0], # Position xyz
                             [0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0],
                             [0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
@@ -189,45 +194,58 @@ class dynamic_model_vehicle(nn.Module):
                             [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
                             [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],])
     
-        self.ss= torch.from_numpy(self.state_space).float()
+        self.ss= torch.from_numpy(self.state_space).float().cuda()
 
     def forward(self, x, dt):
-
-        x_dot = torch.matmul(self.ss, x.squeeze().T)
-
+        """
+        Performs RK4 update of vehicle state
+        """
+        _,B,C,N = x.shape # B is the timesteps, C is "channels", N is number of features integrated
+        
+        if C > 1: # sinze "batch_sizes" of 1 get removed in squeeze operations, this just reshapes if needed
+            x_dot = torch.matmul(self.ss, x.squeeze().T)
+        else: 
+            x_dot = torch.matmul(self.ss, x.squeeze().unsqueeze(0).T)
+        
         dkd1 = x_dot
         dkd2 = x_dot + dkd1*(dt/2)
         dkd3 = x_dot + dkd2*(dt/2)
         dkd4 = x_dot + dkd3*dt
 
         dk_totall = (dkd1 + 2*dkd2 + 2*dkd3 + dkd4)/6
+
         dk_totall = dk_totall.reshape(1,1,dk_totall.shape[0],dk_totall.shape[1]).transpose(-2,-1)
 
         x = x + dk_totall*dt
-
+        
         return x
 
 
 class UKF(nn.Module):
-    def __init__(self, l_size, s_size, l_hist, v_hist):
+    def __init__(self, l_size, s_size, l_hist, v_hist, e, d, emb, h):
         super().__init__()
 
-        self.dynamics = dynamic_model(numVstates = s_size)
+        self.dynamics = dynamic_model(numVstates = s_size, latent_size = l_size, enc_ = e, dec_ = d, emb_ = emb, hist_ = h)
         self.sigma_ = sigma_points
         self.ukf = UKF_update
 
         self.s_l = l_size # 1024 // (8*4)
         self.s_v = torch.eye(s_size)
 
-        R_tensor_p = torch.eye(s_size) * torch.abs(torch.randn(s_size)) #self.s_v.shape) #torch.tensor(self.s_v, dtype=torch.double).random_(0,1) # Initialize measurement noise as random tensor [0,1]
-        R_tensor_l = torch.eye(l_size) * torch.abs(torch.randn(l_size)) # torch.tensor(torch.eye(49), dtype=torch.double).random_(0,1) # Initialize measurement noise as random tensor [0,1]
-        Q_tensor = torch.eye(s_size) * torch.abs(torch.randn(s_size)) # torch.tensor(6, dtype=torch.double).random_(0,1) # Initialize vehicle process noise as random tensor [0,1] for the 6dof
-        Q_tensor_l = torch.eye(l_size) * torch.abs(torch.randn(self.s_l)) # torch.tensor(self.s_l, dtype=torch.double).random_(0,1) # Initialize latent process noise as random tensor [0,1]
+        R_tensor_p = torch.eye(s_size) * torch.abs(torch.randn(s_size)) # Initialize measurement noise as random tensor [0,1]
+        R_tensor_l = torch.eye(l_size) * torch.abs(torch.randn(l_size)) # Initialize measurement noise as random tensor [0,1]
+        Q_tensor = torch.eye(s_size) * torch.abs(torch.randn(s_size)) # Initialize vehicle process noise as random tensor [0,1] for the 6dof
+        Q_tensor_l = torch.eye(l_size) * torch.abs(torch.randn(self.s_l)) # Initialize latent process noise as random tensor [0,1]
 
         self.Q_k_x = nn.Parameter(data = Q_tensor, requires_grad = True) # Learned process noise parameters
         self.Q_k_l = nn.Parameter(data =Q_tensor_l, requires_grad = True) # Learned process noise parameters
         self.R_kp = nn.Parameter(data = R_tensor_p, requires_grad = True) # Learned measurement noise parameters
         self.R_kl = nn.Parameter(data = R_tensor_l, requires_grad = True) # Learned measurement noise parameters
+        
+        self.P_tensor_l = torch.eye(l_size) * torch.abs(torch.randn(l_size))
+        self.P_tensor_s = torch.eye(s_size) * torch.abs(torch.randn(s_size) )                                                 
+        self.P_init_l = nn.Parameter(data = self.P_tensor_l, requires_grad = True)
+        self.P_init_s = nn.Parameter(data = self.P_tensor_s, requires_grad = True)
 
         self.tf_len = 15
         self.embed = True
@@ -238,10 +256,12 @@ class UKF(nn.Module):
         self.latent_history = l_hist
         self.vehicle_history = v_hist
 
-    def predictor(self, image_t2, latent, x_vehicle, dt, P_xx_prior, P_xxl_prior): # Inputs: image at time t+1, vehicle state at time t, altent time t/k
+    def predictor(self, latent, x_vehicle, dt, P_xx_prior, P_xxl_prior): # Inputs: image at time t+1, vehicle state at time t, altent time t/k
 
          # either embed the new latents and states every tf_len steps/ based on some energy metric above a threshold
+            # NTOE: since the initial training is primarily for learning the dynamic model by making Keys for the attention network, every pass needs to perform an embedding. This won't be the case in inference where we only embed when a set of yet determined criteria are met (likely a change in magnitude or cosine similarity threshold)
         if 1: #self.energy > self.threshold: # All good jsut need to update state history each loop
+            
             self.key = self.dynamics.embed(self.latent_history, self.vehicle_history)
 
         # Priori update---------------
@@ -264,6 +284,7 @@ class UKF(nn.Module):
       
         return X_kpose_post, X_klatent_post, P_kp_post, P_kl_post, K_kp, K_kl
 
+    
 
     def F(self, latent, x_vehicle, P_xx_prior, P_xxl_prior, dt):
         """
@@ -284,6 +305,7 @@ class UKF(nn.Module):
         return yhat_pose_sigma, sigma_l_prior # Yhat at time t+1 based on sigma from latent hat
 
 
+    # THis is not used in the final version. I no longer think it is a smart idea to learn any mappings for the filtered vector before you pass it back to the base neural network. It strikes me as to easy to learn a trivial mapping of zero
 class SE_mapped(nn.Module):
     def __init__(self, inp, reduction_factor):
         super().__init__()
@@ -294,8 +316,8 @@ class SE_mapped(nn.Module):
         self.c3 = nn.Conv2d(i//2, i//4, 7)
         self.bn = nn.BatchNorm2d(i)
 
-        self.map_mul = nn.Linear(256, 1024)
-        self.map_add = nn.Linear(256, 1024)
+        self.map_mul = nn.Linear(i, inp)
+        self.map_add = nn.Linear(i, inp)
 
         self.act = nn.PReLU()
 
@@ -317,6 +339,6 @@ class SE_mapped(nn.Module):
         """
         x_mul = self.act(self.map_mul(x_))
         x_add = self.act(self.map_add(x_))
-        x = (skip.permute(0,2,3,1) * x_mul + x_add).reshape(8, 128, 28, 28) # skip connection gets perturbed by a mult and add method
+        x = (skip.permute(0,2,3,1) * x_mul + x_add).reshape(4, 128, 28, 28) # skip connection gets perturbed by a mult and add method (8, 128, 28, 28)
         x = self.bn(x)
         return x
