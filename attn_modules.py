@@ -156,14 +156,12 @@ class AttnGlobal(nn.Module):
         
         attention = self.sf((k @ q_global.transpose(-2,-1)))
         attention = self.attn_drop(attention)
-        # This is global layer
-        #assert attention @ v, print("Attn: ", attention.shape, "V: ", v.shape)
-        #assert attention.shape[3] == v.shape[1], print("OH SHIT: ", k.shape, q_global.shape)
+        # This is the "global" layer
         out_1 = attention @ v
         out_2 = self.proj(out_1)
         x = self.proj_drop(out_2)
 
-        return x # Returns: [1,B_,N,Dim] tensor, idk why the 1 is there or where it came from...
+        return x 
 
 
 class AttnDyn(nn.Module):
@@ -194,7 +192,7 @@ class AttnDyn(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         
     def forward(self, x, kv):
-        
+        # Takes two arguments, x is the Query, and kv is a concatenated Key and Value matrix so it's 3 distinct variables 
         # x = [N, window_size, window_size]
         B_, n, p = x.shape
 
@@ -207,14 +205,11 @@ class AttnDyn(nn.Module):
         
         attention = self.sf((k @ q_global))
         attention = self.attn_drop(attention)
-        # This is global layer
-        #assert attention @ v, print("Attn: ", attention.shape, "V: ", v.shape)
-        #assert attention.shape[3] == v.shape[1], print("OH SHIT: ", k.shape, q_global.shape)
         out_1 = torch.matmul(attention, v.permute(1,0)).permute(1,0)
         out_2 = self.proj(out_1).unsqueeze(0)
         x = self.proj_drop(out_2)
 
-        return x # Returns: [1,B_,N,Dim] tensor, idk why the 1 is there or where it came from...
+        return x 
 
 class AttnBlock(nn.Module):
     def __init__(self,
@@ -254,7 +249,7 @@ class AttnBlock(nn.Module):
         x = self.norm_1(x)
         attn =self.attn.forward(x, q_global) #Input: partioned window [NxD] tensor, Returns: [NxD] tensor
 
-        if attn.shape[1] > 256:
+        if attn.shape[1] > 128:
             attn_mean = torch.mean(attn, dim=1)
             latent = attn_mean + skip
         else:
@@ -265,79 +260,65 @@ class AttnBlock(nn.Module):
 
 class attention_local_global_layer(nn.Module):
     def __init__(self, dim, depth, heads, AttnType):
+        """
+        Since we don't change the type of attention and we don't reduce the feature space between passes, this block doesn't do anything. It's a carryover from other attn networks I used
+        """
         super().__init__()
-        """
-        Fuck it this is just gonna hard sandwich a local MHSA with a GMHA
         
-        This is the backbone of my pattented Odometry Guided generative Relocalization (something with E) or OGRE for short. Get it? Cause it's SO LAYERED... ha
-        This ogres block can be repeated and stacked as many times as desired, but each attentonlayer creates (P^2)*D + N*D parameters so don't go hog wild
-        """
         heads = heads
         depth = depth
-        self.reduce = False
         self.d = dim
-        """
-        self.ogres = nn.ModuleList([AttnBlock(attn_type = AttnLocal if (i % 2 == 0) else AttnGlobal, 
-                                              dim = dim, 
-                                              heads = heads)
-                                    for i in range(depth)]) #Note: this is a stack of local->global transformer layers. It can go as deep as you want but keeps the same Dim per class isntance
-        """
+
         self.ogres = nn.ModuleList([AttnBlock(attn_type = AttnType,
                                               dim = dim, 
                                               heads = heads)
                                     for i in range(depth)]) #Note: this is purely local self attention 
 
-        self.feat_extract = FeatExtract(dim = dim, keep_dim = True)
-        self.reduce = False
-        #self.gloabl_q = global_q_gen(stuff)
     def forward(self, x, q_global):
         
-        #q_global = self.global_q(x)
         for layer in self.ogres:
             x = layer(x, q_global)
-        
-        if self.reduce:
-            a, b, c = x.shape
-            x = x.permute(0,2,1)
-            x = self.feat_extract( x.reshape( a, c, int(np.sqrt(b)), int(np.sqrt(b)) ) ).reshape( a, b, -1 ).permute( 1,0,2 )
-            
-        # Note: at the end of every pass we reduce size of the input except for the last layer of the transformer. This is done by the [conv(3)->GELU()->SE()->CONV(1)] -> conv_down((dim, dim*2)
+
         return x
 
 
 class encoder_attn(nn.Module):
-    def __init__(self, numVstates):
+    def __init__(self, numVstates, numWindows, enc_, dec_, emb_):
         """
-        This will be the single class called in each training pass. Has to handle averything for a single transformer. 
-        We have three transformers each taking a different slice of autoencoder latent space
         
         input:
-            depth: the depth of each transformer layer all with dimension D
-            head: the number of heads in each local+global pair
+            numVstates = is the number of vehicle states. We have translation, rotation, and their two respective time derivatives = 18
+            numWindows = we break the input vector into numWindows (4) number of smaller vectors 
+            enc_ = not sure rn tbh, I forgot
+            dec_ = the dimension of the vector we are trying to filter, which we need to specify to keep an attention matrix of equal size. This is 256 here
+            emb_ = The number of parameters we "embed" into the KQV inputs. Unlike a traditional tranformer we only append an embeding, we don't perform a position embeding
         """
         super().__init__()
 
-        dim_encoder = 8 # Dimension at AttnBlock 
+        dim_encoder = enc_ #numWindows # Dimension at AttnBlock ogre
         d_encoder = 2
         num_heads_encoder = 1
         layer_depth_encoder = 2
         self.max_sequence_length = 15 # how many time steps we will use the same key before restarting
+        self.emb_dim = emb_
 
-        dim_dynamics = 256
+        dim_dynamics = dec_
+        self.numWindows = 4
         d_dynamics = 2
         num_heads_dynamics = 1
         layer_depth_dynamics = 2
         self.key = 0
-        emb = torch.rand((23, 4, 8))
-        self.e = nn.Parameter(data = emb, requires_grad=True)
-        emb_q = torch.rand((23, 1, 8))
-        self.e_q = nn.Parameter(data = emb_q, requires_grad=True)
+        emb = torch.rand((self.emb_dim, 3, self.numWindows))
+        self.e = nn.parameter.Parameter(data = emb, requires_grad=True)
+        emb_q = torch.rand((self.emb_dim, 1, self.numWindows))
+        self.e_q = nn.parameter.Parameter(data = emb_q, requires_grad=True)
 
         at_l = AttnLocal
         at_g = AttnGlobal
         at_dyn = AttnDyn
 
-        self.q_map = nn.Linear(32 + self.emb_dim + numVstates,256)
+        self.q_map = nn.Linear(112, 256*(8//self.numWindows))
+        self.key_map = nn.Linear(3,4)
         self.dynamic_map = nn.Linear(8,1)
 
 
@@ -351,27 +332,34 @@ class encoder_attn(nn.Module):
 
     def key_emb(self,x):
         """
-        The forward takes either an image or a flat vector of arbitrary size, patch embeds it
-        then runs it through the corresponding attention network, the norms+avgpools+flattens it again
+        This is the most mishmashed part of the attention network. It performs self attention on the concatenated latent space history and vehicle state. We have repeated the vehicle state a few times to increase the relative importance to the latent space. This returns a 256x8 Key 
         """
+    
         x = x.permute(2,0,1)
-        x = torch.concat((x, self.e), dim = 0).permute(1,0,2)
+        x = torch.concat((x, self.e.cuda()), dim = 0).permute(1,0,2)
         for layer in self.encode:
             x = layer(x, x)
+            
+        x = x.reshape(7,64,-1)
+        x = self.key_map(x).flatten(-2,-1)
         
-        x = x.reshape(8,64,-1).flatten(-2,-1)
 
         return x
        
     def dynamic_update(self, q, k, v):
-
-        q = torch.concat((q.permute(2,0,1), self.e_q), dim = 0).permute(2,1,0) #.flatten()
-        q = self.q_map(q).squeeze().unsqueeze(0)
+        """
+        This is the actual dynamic model. It takes a learned Key representing the dynamic model at time k-1:n, a Query representing the mapped vehicle state, and the Values which are the sigma points we want to transform.
+        """
+        # Embed the learned parameters to the query and map to the correct size
+        q = torch.concat((q.permute(2,0,1), self.e_q), dim = 0).permute(2,1,0)
+        q = self.q_map(q).squeeze().reshape(8,-1).unsqueeze(0)
+        #concat the Key and Value vectors
         kv = torch.concat((k.unsqueeze(0),v),dim=1)
 
+        # Since we pass the Key and Value vectors as the "global" parameter, they remain constant through the attention process. The only thing that chanegs is the Query matrix, which in our case starts off as the sigma points. The thinking here is that through several attention layers we are perturbing the distribution toward the next target distribution which is are sigma points at time K+1
         for layer in self.dynamics:
             q = layer(q,kv)
-        
+        # We have an embed dimension of 8, so we do a linear transformation to squeze it back down to 1. Outputs a 256x1 vector
         x = self.dynamic_map(q.permute(0,2,1))
             
         return x
